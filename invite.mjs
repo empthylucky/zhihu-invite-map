@@ -3,8 +3,8 @@
  * 知乎「邀请回答」接口地图
  *
  * 读接口全部实测可用（web cookie + x-zse-96 v2 签名）。
- * 写接口（POST / DELETE）被服务端在路由层拒绝，返回 400 MalformRequestException，
- * 与 body / content-type / src / 签名方式 / host 全部无关。详见 README。
+ * 写接口也全部可用 —— 关键是字段名：web 用 member_hash，不是安卓的 people_ids。
+ * 详见 README 第零节。
  *
  * 用法：
  *   ZHIHU_COOKIE_FILE=auth/zhihu-cookie.json node invite.mjs recommend <question_id>
@@ -12,7 +12,7 @@
  *   node invite.mjs search <question_id> 关键词
  *   node invite.mjs invited <question_id>
  *   node invite.mjs auto <question_id>
- *   node invite.mjs invite <question_id> <member_id>[,<member_id>...]
+ *   node invite.mjs invite <question_id> <member_hash>[,<member_hash>...]
  *
  * cookie 文件格式：每行一个值。第 1 行 z_c0，第 2 行 d_c0（必填，缺了签名过不了）。
  * 也可以用环境变量 ZHIHU_Z_C0 / ZHIHU_D_C0。
@@ -157,23 +157,40 @@ export class ZhihuInvite {
     return this.request(enable ? 'POST' : 'GET', p)
   }
 
-  // ───────────── 写：服务端拒绝，保留以便验尸 ─────────────
+  // ───────────── 写：可用 ─────────────
 
   /**
-   * 邀请指定的人。**实测必然失败**，抛 400 MalformRequestException。
-   * 参数格式来自安卓端反编译 smali：@POST + @FormUrlEncoded + @Field("people_ids")。
-   * 我们按这个格式发了，仍被拒 —— 说明拦的不是参数，是路由。
+   * 邀请指定的人。实测可用，返回 { success: true }。
+   *
+   * 字段是 member_hash，不是 people_ids。
+   * people_ids 是安卓端反编译 smali 里的字段（@Field("people_ids")），web 用的是 member_hash。
+   * 用错字段会返回 400 MalformRequestException —— 那个错长得像权限问题，其实只是「我不认识这个字段」。
+   *
+   * member_hash 就是 recommendation_invitees 返回里 member.id 那个 32 位 hex。
    */
-  invite(questionId, memberIds) {
-    const ids = Array.isArray(memberIds) ? memberIds.join(',') : String(memberIds)
+  invite(questionId, memberHash, src = 'normal') {
     return this.request('POST', `/api/v4/questions/${questionId}/invitees`, {
-      form: { people_ids: ids },
+      body: { member_hash: memberHash, src },
     })
   }
 
-  /** 取消邀请某个人。**实测必然失败**，同样 400。 */
-  uninvite(questionId, memberId) {
-    return this.request('DELETE', `/api/v4/questions/${questionId}/invitees/${memberId}`)
+  /** 一次邀请多个。逐个发，中间留间隔。 */
+  async inviteMany(questionId, memberHashes, { gapMs = 3000 } = {}) {
+    const out = []
+    for (const h of memberHashes) {
+      try {
+        out.push({ member_hash: h, ok: true, res: await this.invite(questionId, h) })
+      } catch (e) {
+        out.push({ member_hash: h, ok: false, error: e.message })
+      }
+      if (gapMs) await new Promise((r) => setTimeout(r, gapMs))
+    }
+    return out
+  }
+
+  /** 取消邀请某个人。 */
+  uninvite(questionId, memberHash) {
+    return this.request('DELETE', `/api/v4/questions/${questionId}/invitees/${memberHash}`)
   }
 }
 
@@ -193,31 +210,41 @@ if (isMain) {
     switch (cmd) {
       case 'recommend': {
         const j = await z.recommend(qid)
-        // one_button_invite / left_invitation 在顶层，名单在 data.recommend_invite
+        // one_button_invite / left_invitation / paging 在顶层；名单在 data，是个数组
         console.log(
           `一键邀请: ${j.one_button_invite}  禁止邀请: ${j.is_forbid_invite}  剩余额度: ${j.left_invitation}  候选总数: ${j.paging?.totals}`,
         )
-        const list = j.data?.recommend_invite ?? j.recommend_invite ?? []
+        const list = Array.isArray(j.data) ? j.data : (j.data?.recommend_invite ?? j.recommend_invite ?? [])
         for (const it of list) {
-          const m = it.member
+          const m = it.member ?? it
           console.log(`  ${it.is_invited ? '✓' : ' '} ${m.id}  ${m.name}`)
         }
         break
       }
       case 'candidates': {
         const list = await z.candidates(qid)
-        for (const it of list) console.log(`  ${it.member.id}  ${it.member.name}`)
+        for (const it of list) {
+          const m = it.member ?? it
+          console.log(`  ${m.id}  ${m.name}`)
+        }
         break
       }
       case 'search': {
         const j = await z.search(qid, arg ?? '')
-        for (const it of j.data ?? []) console.log(`  ${it.member.id}  ${it.member.name}`)
+        for (const it of j.data ?? []) {
+          const m = it.member ?? it
+          console.log(`  ${m.id}  ${m.name}`)
+        }
         break
       }
       case 'invited': {
         const list = await z.invited(qid)
         if (!list.length) console.log('  还没邀请过任何人')
-        for (const it of list) console.log(`  ${it.member?.id}  ${it.member?.name}`)
+        // /invitees 返回的是扁平成员对象，没有 .member 包装
+        for (const it of list) {
+          const m = it.member ?? it
+          console.log(`  ${m.id}  ${m.name}`)
+        }
         break
       }
       case 'auto': {
@@ -225,11 +252,14 @@ if (isMain) {
         break
       }
       case 'invite': {
-        try {
-          console.log(JSON.stringify(await z.invite(qid, arg), null, 2))
-        } catch (e) {
-          console.error(`失败（预期内）: ${e.message}`)
-          process.exit(2)
+        const hashes = String(arg ?? '').split(',').map((s) => s.trim()).filter(Boolean)
+        if (!hashes.length) {
+          console.error('用法: node invite.mjs invite <question_id> <member_hash>[,<member_hash>...]')
+          process.exitCode = 1
+          break
+        }
+        for (const r of await z.inviteMany(qid, hashes)) {
+          console.log(`${r.ok ? '✅' : '❌'} ${r.member_hash}  ${r.ok ? JSON.stringify(r.res) : r.error}`)
         }
         break
       }
