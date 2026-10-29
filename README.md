@@ -2,21 +2,112 @@
 
 实测记录：作者本人的账号（web cookie + `x-zse-96` v2 签名）在 2026-10 对知乎邀请回答相关接口做了一次完整测绘。
 
-**结论先放这里：读接口全部可用，写接口全部关闭。** 关闭方式不是在参数上校验，而是在路由层直接拒绝 —— 所以想靠调格式绕过是没有出路的。
+**结论：读接口全部可用，写接口也完全可用。**
 
-如果你是想给知乎问题拉回答的人，直接看[第五节](#五那到底该怎么办)那段，能省你两天。
+上一版这份文档写的是「写接口全部关闭」。**那是错的。** 我错了三天，错因值得写在最前面。
 
 ---
 
-## 一、完整接口表
+## 零、我错在哪
 
-来自知乎安卓端反编译：
+我试了三天、三十多种组合，全都返回同一个：
 
-```smali
-# com/zhihu/android/api/b/s.smali  (.source "InviteeService.java")
+```json
+{"error": {"message": "请求错误", "code": 400, "name": "MalformRequestException"}}
 ```
 
-对照实测结果：
+于是我下了个结论：写路由只对安卓客户端或 OAuth 开放，web 会话进不去。
+
+**真因是一个字段名。**
+
+```diff
+- {"people_ids": ["8e00e59b3b7bd216942a59ccdd03d24e"]}                    → 400
++ {"member_hash": "8e00e59b3b7bd216942a59ccdd03d24e", "src": "normal"}    → 200 {"success": true}
+```
+
+`people_ids` 这个字段名来自安卓端反编译的 smali 注解。**安卓用 `people_ids`，web 用 `member_hash`。** 两个客户端，两套字段。
+
+`MalformRequestException` 不是「你没权限」，是「我不认识你这个字段」。它长得像权限错误，所以很容易被误判成权限问题——我就误判了。
+
+### 怎么才查出来的
+
+不再猜。开一个真浏览器，让页面自己去发那条请求，把请求录下来。
+
+沙箱里开浏览器的两个坑：
+
+- node `spawn` → `EPERM`（管道被禁）
+- 直接 `Start-Process msedge` → `FATAL: mojo platform_channel.cc Check failed: 拒绝访问 (0x5)`（命名管道被禁）
+
+两个都要放开文件沙箱才能过。过了之后走 CDP：
+
+```bash
+msedge --headless=new --remote-debugging-port=9333 --user-data-dir=<某个工作目录>
+```
+
+然后在 node 里连 `http://127.0.0.1:9333/json/list` 拿 `webSocketDebuggerUrl`，用全局 `WebSocket` 走 CDP。
+
+**录请求要用 CDP 的 `Network.requestWillBeSent`，不要用 JS 钩子。** 钩子只能看到 `fetch`/`XMLHttpRequest`，SPA 内部分层会把它绕过去。
+
+还有：知乎的 HTML 页面有一层 `zh-zse-ck` 挑战，直接抓页面会 403。真浏览器跑完那段混淆脚本后会种一个 `__zse_ck` cookie。但**写接口并不强制要求它**——实测去掉也能通。
+
+---
+
+## 一、邀请回答（写）—— 可用
+
+```http
+POST https://www.zhihu.com/api/v4/questions/{question_id}/invitees
+content-type: application/json
+x-zse-93: 101_3_3.0
+x-zse-96: 2.0_<签名>
+x-requested-with: fetch
+x-xsrf-token: <_xsrf>
+
+{"member_hash": "<member.id 那串 32 位 hex>", "src": "normal"}
+```
+
+返回 `{"success": true}`。
+
+- `member_hash` 就是 `recommendation_invitees` 返回里 `member.id` 那个值
+- `src` 实测填 `normal` 可用
+- **`x-zst-81` 不是必须的**（浏览器会带，服务端不强制）
+- 额度：`left_invitation` 每次减一，可以为负
+- 取消邀请：`DELETE /api/v4/questions/{qid}/invitees/{member_hash}`
+
+---
+
+## 二、改问题 / 绑话题（写）—— 能用，但话题格式未知
+
+真实接口不是 `/api/v4/questions/{id}`，是：
+
+```http
+POST https://www.zhihu.com/api/v4/content/publish
+content-type: application/json
+```
+
+```json
+{
+  "action": "question",
+  "data": {
+    "publish": { "traceId": "<uuid>" },
+    "title": { "title": "<当前标题>" },
+    "reason": { "reason": "补充话题" },
+    "extra_info": { "include": "topics", "publisher": "pc" },
+    "draft": { "contentId": "<question_id>", "isPublished": true },
+    "topic": { "topics": [] }
+  }
+}
+```
+
+返回 `{"code": 0, "message": "success"}`。
+
+两点注意：
+
+1. **网页端的「修改理由」是弹窗里选一个选项**（标点或格式错误 / 不构成提问 / 包含主观判断 / 缺乏可信来源 / 其他），选「其他」之后才出现一个自由文字输入框，占位符是「请输入修改理由（必填）」。那段文字就是 `reason.reason`。接口层不校验取值。
+2. **`topic.topics` 的格式我还没解开。** 传 `{id, name}`、`{id: "字符串", name}`、搜索接口返回的完整话题对象、只传 `name`，全都返回 `code: 0` 但话题列表仍然是空的。传纯 id 字符串数组返回 `code: 2`（校验失败）。解开了欢迎告诉我。
+
+---
+
+## 三、读接口（全部可用）
 
 | 方法 | 路径 | 参数 | 实测 |
 |---|---|---|---|
@@ -24,15 +115,11 @@
 | `GET` | `/api/v4/questions/{qid}/recommend_invitees` | `offset` `limit` | ✅ 200（早期接口，结构不同） |
 | `GET` | `/api/v4/questions/{qid}/invitation-candidates` | — | ✅ 200 |
 | `GET` | `/api/v4/questions/{qid}/invitees/search` | `q` `offset` `limit` | ✅ 200 |
-| `GET` | `/api/v4/questions/{qid}/invitees` | — | ✅ 200（已邀请名单，没邀请过是 `[]`） |
+| `GET` | `/api/v4/questions/{qid}/invitees` | — | ✅ 200（已邀请名单） |
 | `GET` | `/api/v4/questions/{qid}/auto_invite` | — | ✅ 200 |
 | `POST` | `/api/v4/questions/{qid}/auto_invite` | — | ✅ 200 |
-| `POST` | `/api/v4/questions/{qid}/invitees` | `@FormUrlEncoded` `people_ids` | ❌ 400 |
-| `POST` | `/api/v4/questions/{qid}/invitations` | — | ❌ 400 |
-| `POST` | `/api/v4/questions/{qid}/invitations/batch` | — | ❌ 400 |
-| `DELETE` | `/api/v4/questions/{qid}/invitees/{member_id}` | — | ❌ 400 |
 
-`recommendation_invitees` 和 `recommend_invitees` 是两个不同的接口，别搞混。带 `ation` 的那个才是现在用的，返回体长这样：
+`recommendation_invitees` 和 `recommend_invitees` 是两个不同的接口，别搞混。带 `ation` 的那个才是现在用的：
 
 ```json
 {
@@ -40,121 +127,45 @@
   "is_forbid_invite": false,
   "left_invitation": 15,
   "paging": { "is_end": false, "totals": 39 },
-  "data": {
-    "invited": [],
-    "last_invite": [],
-    "friend_invite": [],
-    "recommend_invite": [
-      { "is_invited": false, "member": { "id": "9872d4...", "name": "菜梦" }, "reasons": [...] }
-    ]
-  }
+  "data": [ ... 35 条 ... ]
 }
 ```
 
----
-
-## 二、写接口是怎么死的
-
-我试过的所有组合，全部返回同一个错误：
-
-```json
-{ "error": { "message": "请求错误", "code": 400, "name": "MalformRequestException" } }
-```
-
-排除过的变量：
-
-- **body 格式** — `application/json` 的 `{"people_ids":[...]}`、`{"people_ids":"..."}`、`{"people_id":"..."}`；`x-www-form-urlencoded` 的 `people_ids=X`；空 body。**四种结果完全一样。**
-- **`src` 字段** — 文档提到有 `src`，试了 `invite_page` / `question` / `invite` / `normal` / `answer_editor` / `invite_answer` / `question_invite` / `invitee` / `answer_invite` / `QuestionPage` / `web` / 空值。全部一样。
-- **签名方式** — 签名带 body、签名不带 body、签名为空串。全部一样。
-- **host** — `www.zhihu.com/api/v4/...` 和 `api.zhihu.com/...`，全部一样。
-- **额外 header** — 加 `x-api-version: 3.0.91`，一样。
-
-关键判据是**空 body 和带 body 报同一个错**：
-
-> 空 body 也报 `MalformRequestException`，说明请求在解析 body 之前的中间件层就被拒了。参数格式根本不是瓶颈。
-
-另一个关键判据是 `DELETE /invitees/{member_id}` **也报同样的 400**。删除不需要任何 body。它和「body 格式错」这个假设是互斥的。
-
-### 对照组：证明不是我的问题
-
-往 `/questions/{qid}/answers` 发一个空 JSON：
-
-```json
-HTTP 422
-{ "error": { "code": 4000, "name": "UnprocessableError", "message": "请求错误" } }
-```
-
-**422 而不是 400。** 这是个业务校验错误（内容不能为空），说明签名、cookie、`x-zse-96`、POST 方法全都正常工作 —— 服务端读到了我的请求，只是内容不合格。
-
-而且同一个 cookie 打 `POST /api/v4/questions/{qid}/auto_invite` → **200**。所以 `api.zhihu.com` 上的写操作对 web cookie 也是开放的，卡住的只有 `invitees` 这条路由。
-
-### 所以结论是
-
-`invitees` 的写路由只对**安卓客户端 / OAuth 应用**开放，web session 进不去。这可能是有意的（防脚本批量邀请），也可能是 web 端压根不提供手动邀请（见下一节）。
-
----
-
-## 三、其实知乎早就在帮你邀请了
-
-`auto_invite` 返回的东西很说明问题：
-
-```json
-{
-  "status": "open",
-  "title": "已成功委托刘看山",
-  "description": "已有 401 人浏览，为你持续邀请中",
-  "avatar": "https://pic2.zhimg.com/80/v2-85ef...t.jpg"
-}
-```
-
-刘看山是知乎的吉祥物。「委托刘看山」就是知乎官方的**自动邀请**服务 —— 平台自己按算法挑人推荐你的问题，不需要你一个个点。
-
-这个服务默认是开着的。`one_button_invite: true` 也是这个意思。
-
-也就是说：**我一直想手写的那个功能，官方已经提供了，而且在我折腾接口的这几天它一直在跑**。那个问题有 401 次浏览。
-
-只不过 401 浏览之后仍然是 0 个回答。有人看，没人答。这跟接口没有关系了。
+`one_button_invite` / `left_invitation` / `paging` 在**顶层**，名单在 `data` 里，是个数组。
 
 ---
 
 ## 四、`405` 是个好东西
 
-这次测绘最值钱的收获不是接口表，是找接口的办法。
-
-猜 body 格式是最没效率的。**先用 GET 打一遍路径，看状态码分类**：
+找接口别猜 body 格式。**先用 GET 打路径，看状态码分类**：
 
 | 状态码 | 含义 |
 |---|---|
 | `200` | 路径存在且可读 |
-| `405` | **路径存在，但不接受 GET** → 真正的写入端点就是它，换 POST |
-| `404` | 路径不存在，名字错了，别再试 |
+| `405` | **路径存在，但不接受 GET** → 真正的写入端点就是它 |
+| `404` | 路径不存在，名字错了 |
 | `403` | 存在，但签名/权限不够 |
 | `400 Malform` | 路由层就拒了，跟 body 无关 |
 
-`405` 是这里面信息量最大的一个 —— 它替你确认了路径拼写正确，只是方法不对。
-
-靠这个我十分钟内就区分开了：
+靠这个十分钟就能区分：
 
 ```
 405  /questions/{qid}/invitations          ← 存在
+404  /questions/{qid}/topics               ← 不存在
 404  /questions/{qid}/settings             ← 不存在
-404  /questions/{qid}/invitee_suggestion   ← 不存在
 ```
 
-比逐个猜 body 格式快一个数量级。`probe.mjs` 就是干这个的。
+`probe.mjs` 就是干这个的。
+
+**但 405 只告诉你「路在哪」，不告诉你「怎么走」。** 字段名还是得看真实请求。
 
 ---
 
-## 五、那到底该怎么办
+## 五、错误码怎么读
 
-如果你真的想给一个问题拉到回答：
-
-1. **别碰邀请接口。** 走不通，我在第二节列了全部排除变量，你可以直接跳过这两天。
-2. **去看 `auto_invite` 是不是开着。** 大概率开着的。
-3. **`left_invitation: 15` 这个数字** 说明还有 15 个额度。额度在消耗，只是没转化成回答。
-4. **问题本身值不值得答，比邀请谁更重要。** 401 浏览 0 回答，问题不在分发，在题目。
-
-第 4 条是我自己的数据教我的。
+- **错误换了种类，才算往前走了一步。** 改问题那次，从「问题必须要有标题」变成「请填写问题修改理由」，说明 payload 形状对了，只差一个字段。
+- **错误没变，就是没动。** 三十几个 400 长得一模一样，说明我一直在原地。
+- **500 不是进展。** 往邀请接口发裸 JSON 数组会得到 `500 Internal Server Error`——那是服务端拿到类型不对直接崩，不是我走对了。
 
 ---
 
@@ -165,20 +176,18 @@ HTTP 422
 # d_c0 缺了签不出 x-zse-96
 export ZHIHU_COOKIE_FILE=./cookie.txt
 
-node invite.mjs recommend  2098203045251265565   # 推荐邀请名单 + 剩余额度
-node invite.mjs candidates 2098203045251265565   # 候选人（带话题产出）
-node invite.mjs search     2098203045251265565 王 # 按名字搜
-node invite.mjs invited    2098203045251265565   # 已邀请过谁
-node invite.mjs auto       2098203045251265565   # 委托刘看山的状态
+node invite.mjs recommend  2099244404653478245      # 推荐邀请名单 + 剩余额度
+node invite.mjs candidates 2099244404653478245      # 候选人（带话题产出）
+node invite.mjs search     2099244404653478245 王    # 按名字搜
+node invite.mjs invited    2099244404653478245      # 已邀请过谁
+node invite.mjs auto       2099244404653478245      # 委托刘看山的状态
 
-# 这个会失败，留在这里是为了让你能自己验一遍
-node invite.mjs invite     2098203045251265565 9872d430...
+# 这个现在真的能用
+node invite.mjs invite     2099244404653478245 <member_hash>
 ```
 
 ```bash
-# 探测任意路径
-node probe.mjs 2098203045251265565 invitees invitations auto_invite settings
-node probe.mjs --host api.zhihu.com 2098203045251265565 invitees
+node probe.mjs 2099244404653478245 invitees invitations auto_invite settings
 ```
 
 零依赖，只要 Node 18+（用了内置 `fetch`）。
@@ -187,16 +196,18 @@ node probe.mjs --host api.zhihu.com 2098203045251265565 invitees
 
 ## 七、来源
 
-- `hytcyjb/yjboAntiCompilation` — 知乎 3.3.1 反编译，`smali/com/zhihu/android/api/b/s.smali` 是 `InviteeService` 的接口声明原文
-- `DracoUnion/BookerDownloadTool` — `doc/zhihu_api.md`，全站端点清单
-- `RickZhao/ZhiHu-Pro` — `Zhihu.Common/Net/QuestionApi.cs`，`people_ids` 的 form 拼法
-- `oovm/ZhihuLink` — `invitation-candidates` 这个端点最早在这里看到
+- `hytcyjb/yjboAntiCompilation` — 知乎 3.3.1 反编译，`smali/com/zhihu/android/api/b/s.smali` 是 `InviteeService` 的接口声明原文（**注意：那里面的 `people_ids` 是安卓的字段，web 不是**）
+- `DracoUnion/BookerDownloadTool` — `doc/zhihu_api.md`
+- `RickZhao/ZhiHu-Pro` — `Zhihu.Common/Net/QuestionApi.cs`
+- `oovm/ZhihuLink` — `invitation-candidates`
 - `zse-signer.mjs` — `x-zse-96` v2 签名，移植自 zhihu-plus-plus
 
 ---
 
 ## 八、一句话
 
-我花了两天想打开一扇门，最后发现门一直是开的，只是里面没人。
+我花三天想打开一扇门，最后发现门没锁，是钥匙拿反了。
 
-真正挡住回答量的从来不是接口。
+而且我一度把「钥匙拿反」写成了一份很有说服力的结论——「这扇门只对安卓和 OAuth 开放」。文档写得整齐，推理看着也顺，它就是错的。
+
+**先看真实的请求，再下结论。**
